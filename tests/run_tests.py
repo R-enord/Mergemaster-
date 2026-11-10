@@ -427,6 +427,39 @@ def test_file_from_other_version_is_rebuilt():
     assert len(utils.sources_of(result)) == 2
 
 
+def test_toggles():
+    objs, radius = build("touching")
+    result = blend(objs, radius=radius)
+    mod = utils.blend_modifier(result)
+    assert mesh_report(result)[2] == 1           # touching parts fuse into one shell
+    for smoothness in (0.0, 1.0):
+        nodes.set_input(mod, "Smoothness", smoothness)
+        result.update_tag()
+        faces, nonmanifold, shells, _lo, _hi = mesh_report(result)
+        assert nonmanifold == 0 and shells == 1, (smoothness, nonmanifold, shells)
+    nodes.set_input(mod, "Shade Smooth", False)
+    result.update_tag()
+    me = evaluated_mesh(result)
+    assert not any(p.use_smooth for p in me.polygons)
+    nodes.set_input(mod, "Shade Smooth", True)
+    result.update_tag()
+    assert all(p.use_smooth for p in evaluated_mesh(result).polygons)
+
+
+def test_build_test_scenes_script():
+    path = os.path.join(tempfile.mkdtemp(), "scenes.blend")
+    argv = sys.argv
+    try:
+        sys.argv = ["blender", "--", "--save", path, "--blend"]
+        import runpy
+        runpy.run_path(os.path.join(HERE, "build_test_scenes.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+    results = [o for o in bpy.data.objects if utils.is_result(o)]
+    assert len(results) == len(scenes.ALL), len(results)
+    assert os.path.exists(path)
+
+
 def test_materials_transferred():
     objs, _ = build("cube_cylinder")
     result = blend(objs)
@@ -527,7 +560,11 @@ def test_ui_panels_draw():
     for expected in ("blend_master.apply", "blend_master.remove",
                      "blend_master.source_display"):
         assert expected in log, (expected, log)
-    assert len([p for p in log if "Socket" in p or p == "value"]) >= 6, log
+    # Every user-facing modifier input (all but Sources and the hidden
+    # Force Final) is drawn in the panel.
+    shown = [name for name, _type, opts in nodes.MAIN_INPUTS
+             if name != "Sources" and not opts.get("hide_in_modifier")]
+    assert len([p for p in log if "Socket" in p or p == "value"]) == len(shown), (shown, log)
     draw_all(objs[1])                                      # a source is active
 
 

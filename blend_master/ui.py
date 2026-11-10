@@ -82,7 +82,6 @@ class BLENDMASTER_PT_blend(_ResultSubPanel, bpy.types.Panel):
         _draw_input(col, mod, "Radius")
         _draw_input(col, mod, "Smoothness", slider=True)
         col.separator()
-        _draw_input(col, mod, "Bridge Gaps")
         _draw_input(col, mod, "Shade Smooth")
 
 

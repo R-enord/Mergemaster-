@@ -5,43 +5,50 @@ Every node group is generated here in Python (nothing is appended from a
 .blend file), so the add-on is self-contained, diff-able, and can rebuild its
 groups for whichever Blender version is running.
 
-How a blend is computed (all in the result object's local space)
-----------------------------------------------------------------
-Each source object contributes a signed distance d_i(x) (negative inside).
-The blended surface is the zero level of a *smooth minimum* of those
-distances::
+The math (all in the result object's local space)
+-------------------------------------------------
+Each source contributes a signed distance d_i(x) (negative inside).  The
+blended surface is the zero level of a *smooth minimum* of them::
 
     f(x) = smin(d_1, d_2, ..., d_n)
 
-``smin`` equals the plain minimum (a normal union) wherever only one object
-is near, so surfaces away from the junction are untouched.  Where two objects
-are within ``Radius`` of each other it dips below the minimum, which adds the
-fillet material.  We use the polynomial smooth minimum::
+smin equals the plain minimum (an ordinary union) wherever only one source
+is near, so surfaces away from a junction are reproduced exactly; where two
+sources are close it dips below the minimum, which adds the fillet.  We use
+the polynomial smooth minimum::
 
-    h    = max(k - |a - b|, 0) / k              (k = Radius)
-    smin = min(a, b) - k * h**p / (2 p)         (p from Smoothness)
+    h    = max(k - |a - b|, 0) / k
+    smin = min(a, b) - k * h**p / (2 p)
 
-whose gradient is simply a blend of the two input gradients, which makes
-projecting vertices onto the surface cheap (see BM_SmoothUnionField).
+Its gradient is a plain blend of the two input gradients (weights
+1 - h**(p-1)/2 and h**(p-1)/2), so Newton steps onto f = 0 are cheap.
+p comes from Smoothness (2.5 .. 8) and k = Radius * 2p * (1 - 1/sqrt 2), so
+two perpendicular faces get a blend exactly as deep as a circular fillet of
+that radius, whatever the Smoothness.  The blend is faded out where the two
+distance gradients align, i.e. over a part buried just under a face, so
+hidden geometry never bulges the surface (see _build_field).
 
-The mesh is produced in five stages:
+How the mesh is made (BM_Blend)
+-------------------------------
+1  Gather   Collection Info of the blend's collection, realized; each source
+            is tagged with an integer id (bm_src).  Smooth-shaded low-poly
+            sources get Catmull-Clark, creased at sharp edges.
+2  Coarse   voxel union of the sources at 2x voxel size.
+3  Fill     seeds in the blend zone of the coarse mesh grow spheres of radius
+            -f(c) (always inside the blended solid, f is 1-Lipschitz), so
+            touching / close parts get the right topology (neck, bridge).
+4  Fine     voxel union of sources + fill: watertight, correct topology.
+5  Project  vertices away from the blend are raycast onto the exact source
+            surface; blend-zone vertices take Newton steps onto f = 0,
+            alternated with Laplacian relaxation; folded faces (rare, in
+            very tight fillets) are untangled and re-projected.
+6  Finish   materials from the nearest source face, shading, cleanup.
 
-1. Gather   - Collection Info of the blend's source collection, realized, each
-              source tagged with an integer id (``bm_src``).
-2. Coarse   - voxel union of the sources (watertight, sharp creases).
-3. Fill     - on the coarse mesh, find the blend zone and grow spheres into
-              the region the smooth union adds.  This gives parts that only
-              touch, or sit close together, the right topology (a neck or a
-              bridge) before the final pass.
-4. Fine     - voxel union of sources + fill at full resolution.
-5. Project  - Newton steps move every vertex onto f = 0 using the *exact*
-              source surfaces, then a light relax in the blend zone.  This
-              removes voxel stepping and keeps flat areas flat.
-
-Version safety: groups are tagged with ``BUILD_ID`` and the Blender version
-they were built with.  ``ensure_node_groups`` rebuilds them in place
-(preserving interface socket identifiers, and therefore every modifier's
-input values) whenever either changes.
+Version safety: groups are tagged with BUILD_ID and the Blender version they
+were built with.  ensure_node_groups rebuilds them in place, keeping
+interface socket identifiers (and so every modifier's values), whenever
+either changes.  Every API difference between Blender versions is handled in
+this file: see _Builder.option, _capture_items and get/set/draw_input.
 """
 
 import bpy
@@ -61,7 +68,7 @@ ATTR_SRC = "bm_src"
 ATTR_BLEND = "bm_blend"
 ATTR_TMP = "bm_tmp"
 ATTR_MARK = "bm_mark"
-ATTR_GRAD = "bm_grad"
+ATTR_STATE = "bm_state"
 ATTR_FOLD = "bm_fold"
 
 BIG = 1.0e9
@@ -74,12 +81,20 @@ BURIED_TO = 1.0
 
 # Refinement budget, tuned on the tests/ scenes for crease-free fillets and
 # necks (max dihedral angle at the junction) versus viewport update time.
-PREVIEW_ITERATIONS = 2      # Newton steps on the blend zone (render: 4)
+PREVIEW_ITERATIONS = 3      # Newton steps on the blend zone in the viewport
+FINAL_ITERATIONS = 5        # ... for render / Apply
 RELAX_BLUR = 4              # Laplacian iterations per relax round
 RELAX_PROJECT = 1           # Newton steps after each relax round
 PREVIEW_RELAX_ROUNDS = 4    # relax rounds in the viewport
 RELAX_ROUNDS = 6            # relax rounds for render / Apply
 REPAIR_ROUNDS = 2           # fold-repair rounds (cheap when nothing is folded)
+# Sharp-edge band: cosine of the angle between voxel normal and hit face
+# normal, from "on a face" (no smoothing) to "on the edge" (full smoothing).
+EDGE_BAND_FROM = 0.985      # ~10 deg
+EDGE_BAND_TO = 0.90         # ~26 deg
+EDGE_SMOOTH_ROUNDS = 3
+EDGE_SMOOTH_BLUR = 2
+EDGE_TAIL = 0.35            # blend weight below which edge smoothing still applies
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +113,7 @@ MAIN_INPUTS = (
     }),
     ("Smoothness", "NodeSocketFloat", {
         "subtype": "FACTOR", "default_value": 0.5, "min_value": 0.0, "max_value": 1.0,
-        "description": "Profile of the blend: low is tight and crisp, high is soft and full",
+        "description": "Profile of the blend: low is tight and round, high runs out softly into the surfaces",
     }),
     ("Viewport Resolution", "NodeSocketInt", {
         "default_value": 96, "min_value": 16, "max_value": 1024,
@@ -107,10 +122,6 @@ MAIN_INPUTS = (
     ("Render Resolution", "NodeSocketInt", {
         "default_value": 192, "min_value": 16, "max_value": 2048,
         "description": "Voxels along the longest side for renders and Apply (final quality)",
-    }),
-    ("Bridge Gaps", "NodeSocketBool", {
-        "default_value": True,
-        "description": "Grow material between parts that touch or sit within the blend radius",
     }),
     ("Shade Smooth", "NodeSocketBool", {
         "default_value": True,
@@ -149,6 +160,7 @@ PROJECT_INPUTS = (
     ("Epsilon", "NodeSocketFloat", {"default_value": 0.001}),
     ("Max Step", "NodeSocketFloat", {"default_value": 1.0}),
     ("Iterations", "NodeSocketInt", {"default_value": 1, "min_value": 0}),
+    ("Move", "NodeSocketBool", {"default_value": True}),
 )
 PROJECT_OUTPUTS = (
     ("Geometry", "NodeSocketGeometry", {}),
@@ -518,7 +530,33 @@ def _build_field(tree):
 
 
 # --------------------------------------------------------------------------
-# BM_Project: Newton steps onto f = 0, storing the blend weight.
+# Per-vertex projection state, packed in one matrix attribute (ATTR_STATE):
+#   column 1 = Newton step (xyz), blend weight
+#   column 2 = field gradient (xyz), unused
+# Written and read on the point domain only, so values are stored exactly.
+# --------------------------------------------------------------------------
+
+def _store_state(b, geometry, step, weight, gradient, selection):
+    st = b.make("ShaderNodeSeparateXYZ", {0: step}, out=None)
+    gr = b.make("ShaderNodeSeparateXYZ", {0: gradient}, out=None)
+    packed = b.make("FunctionNodeCombineMatrix", {
+        0: st.outputs[0], 1: st.outputs[1], 2: st.outputs[2], 3: weight,
+        4: gr.outputs[0], 5: gr.outputs[1], 6: gr.outputs[2],
+    })
+    return b.store(geometry, ATTR_STATE, packed, 'FLOAT4X4', selection=selection)
+
+
+def _state(b):
+    """(step, blend weight, gradient) fields read from ATTR_STATE."""
+    sep = b.make("FunctionNodeSeparateMatrix", {0: b.named(ATTR_STATE, 'FLOAT4X4')}, out=None)
+    o = sep.outputs
+    step = b.make("ShaderNodeCombineXYZ", {0: o[0], 1: o[1], 2: o[2]})
+    grad = b.make("ShaderNodeCombineXYZ", {0: o[4], 1: o[5], 2: o[6]})
+    return step, o[3], grad
+
+
+# --------------------------------------------------------------------------
+# BM_Project: Newton steps onto f = 0, recording the projection state.
 # --------------------------------------------------------------------------
 
 def _build_project(tree, field_tree):
@@ -549,16 +587,14 @@ def _build_project(tree, field_tree):
     clamp = b.vmin(b.div(b.out(gin, "Max Step"), step_len), 1.0)
     step = b.vec('SCALE', step, scale=b.mul(clamp, -1.0))
 
-    # Evaluate the field once per iteration: store the blend weight and the
-    # step together, then apply the step.
-    stored = b.store(geo, ATTR_BLEND, w, 'FLOAT', selection=b.out(gin, "Selection"))
-    stored = b.store(stored, ATTR_GRAD, g, 'FLOAT_VECTOR', selection=b.out(gin, "Selection"))
-    stored = b.store(stored, ATTR_TMP, step, 'FLOAT_VECTOR',
-                     selection=b.out(gin, "Selection"))
+    # One Store node, one evaluation of the (expensive) field: every Store
+    # or Capture node evaluates its fields on its own, so writing step,
+    # weight and gradient with three nodes would compute the field 3x.
+    stored = _store_state(b, geo, step, w, g, b.out(gin, "Selection"))
     moved = b.make("GeometryNodeSetPosition", {
         "Geometry": stored,
-        "Selection": b.out(gin, "Selection"),
-        "Offset": b.named(ATTR_TMP, 'FLOAT_VECTOR'),
+        "Selection": b.boolean('AND', b.out(gin, "Selection"), b.out(gin, "Move")),
+        "Offset": _state(b)[0],
     })
     b.set(rout, "Geometry", moved)
     b.set(gout, "Geometry", b.out(rout, "Geometry"))
@@ -591,8 +627,10 @@ def _build_main(tree, field_tree, project_tree):
     # Derived parameters ------------------------------------------------------
     radius = b.vmax(b.out(gin, "Radius"), 0.0)
     smooth = b.out(gin, "Smoothness")
-    # Kernel exponent p: 2.5 (soft, full) .. 6 (tight, crisp).
-    exponent = b.add(2.5, b.mul(3.5, b.sub(1.0, smooth)))
+    # Kernel exponent p: 2.5 (tight: compact, round profile) .. 8 (soft: a
+    # long, gentle run-out into the surfaces).  With the depth fixed below,
+    # a higher p spreads the same fillet over a longer, smoother transition.
+    exponent = b.add(2.5, b.mul(5.5, smooth))
     # Kernel width k, calibrated so that where two perpendicular faces meet
     # the blend is exactly as deep as a circular fillet of radius Radius:
     # depth k/(2p) == Radius * (1 - 1/sqrt(2)).
@@ -640,9 +678,9 @@ def _build_main(tree, field_tree, project_tree):
     normal_cap = b.node("GeometryNodeCaptureAttribute", domain='POINT')
     _capture_items(normal_cap, [('VECTOR', "Normal")])
     b.set(normal_cap, "Geometry", coarse)
-    b.set(normal_cap, 1, b.make("GeometryNodeInputNormal"))
+    b.set(normal_cap, "Normal", b.make("GeometryNodeInputNormal"))
     coarse = b.out(normal_cap, "Geometry")
-    coarse_normal = normal_cap.outputs[1]
+    coarse_normal = b.out(normal_cap, "Normal")
 
     # 3. Fill: seeds in the blend zone, spheres of radius -f -----------------------
     seed_field = b.group(field_tree, dict(common, Position=b.position()))
@@ -650,7 +688,6 @@ def _build_main(tree, field_tree, project_tree):
                         b.compare('GREATER_THAN', b.out(seed_field, "Blend"), 0.0),
                         b.compare('LESS_THAN', b.out(seed_field, "Distance"),
                                   b.mul(voxel, -0.5)))
-    in_zone = b.boolean('AND', in_zone, b.out(gin, "Bridge Gaps"))
     seeds = b.make("GeometryNodeMeshToPoints", {
         "Mesh": coarse, "Selection": in_zone,
     }, mode='VERTICES')
@@ -702,23 +739,66 @@ def _build_main(tree, field_tree, project_tree):
     proj_common = dict(common)
     proj_common["Max Step"] = max_step
 
-    def project(geometry, selection, iterations):
+    def project(geometry, selection, iterations, move=True):
         return b.out(b.group(project_tree, dict(
             proj_common, Geometry=geometry, Selection=selection,
-            Iterations=iterations)), "Geometry")
+            Iterations=iterations, Move=move)), "Geometry")
 
     def final_only(viewport_geometry, final_geometry):
         # Switch is lazy: the branch that is not chosen is never computed,
         # so render-only refinement costs nothing in the viewport.
         return b.switch('GEOMETRY', is_view, final_geometry, viewport_geometry)
 
-    # One step everywhere: an exact snap onto the source surfaces away from
-    # the blend, and it records each vertex's blend weight.
-    snapped = b.label(project(fine, True, 1), "5a Snap")
-    # Only vertices that the blend moves noticeably need more Newton steps;
-    # the kernel's long tail moves vertices by far less than a voxel.
-    in_blend = b.compare('GREATER_THAN', b.named(ATTR_BLEND, 'FLOAT'), BLEND_ZONE)
-    projected = project(snapped, in_blend, b.switch('INT', is_view, 4, PREVIEW_ITERATIONS))
+    # Measure every vertex (blend weight, gradient) without moving it.
+    measured = b.label(project(fine, True, 1, move=False), "5a Measure")
+    # Only vertices the blend moves noticeably go through Newton steps; the
+    # kernel's long tail moves vertices by far less than a voxel.
+    in_blend = b.compare('GREATER_THAN', _state(b)[1], BLEND_ZONE)
+    outside = b.boolean('NOT', in_blend)
+
+    # Everywhere else the result is simply the source surface.  Snap there by
+    # casting a ray along the voxel mesh's own normal rather than jumping to
+    # the closest point: near a sharp convex edge every closest point is the
+    # edge itself, so vertices would pile up on it and zigzag, while rays
+    # spread them over the two faces in order and keep the edge clean.
+    normal = b.make("GeometryNodeInputNormal")
+    reach_out = b.mul(voxel, 3.0)
+    ray = b.node("GeometryNodeRaycast")
+    b.set(ray, "Target Geometry", src)
+    b.set(ray, "Source Position", b.vec('ADD', b.position(),
+                                        b.vec('SCALE', normal, scale=reach_out)))
+    b.set(ray, "Ray Direction", b.vec('SCALE', normal, scale=-1.0))
+    b.set(ray, "Ray Length", b.mul(reach_out, 2.0))
+    # Near a sharp edge of a source, no snapping can place vertices exactly
+    # *on* the edge, and the voxel grid's staircase shows through as a
+    # beaded edge.  Those vertices are easy to find: their voxel normal
+    # disagrees with the normal of the face their ray hit (on flat faces
+    # and smooth curves the two agree).  That band is smoothed below into a
+    # clean micro-bevel about a voxel wide.
+    edge_band = b.make("ShaderNodeMapRange", {
+        "Value": b.vec('DOT_PRODUCT', normal, b.out(ray, "Hit Normal")),
+        "From Min": EDGE_BAND_FROM, "From Max": EDGE_BAND_TO, "To Min": 0.0, "To Max": 1.0,
+    }, interpolation_type='SMOOTHSTEP', clamp=True)
+    hit_cap = b.node("GeometryNodeCaptureAttribute", domain='POINT')
+    _capture_items(hit_cap, [('BOOLEAN', "Hit"), ('VECTOR', "Hit Position"),
+                             ('FLOAT', "Edge")])
+    b.set(hit_cap, "Geometry", measured)
+    b.set(hit_cap, "Hit", b.out(ray, "Is Hit"))
+    b.set(hit_cap, "Hit Position", b.out(ray, "Hit Position"))
+    b.set(hit_cap, "Edge", edge_band)
+    hit = b.out(hit_cap, "Hit")
+    snapped = b.make("GeometryNodeSetPosition", {
+        "Geometry": b.out(hit_cap, "Geometry"),
+        "Selection": b.boolean('AND', outside, hit),
+        "Position": b.out(hit_cap, "Hit Position"),
+    })
+    # Rare misses (thin slivers): fall back to the closest-point step.
+    snapped = project(snapped, b.boolean('AND', outside, b.boolean('NOT', hit)), 1)
+    edge = b.out(hit_cap, "Edge")          # smoothed at the very end (5e)
+    b.label(snapped, "5a Snap")
+
+    projected = project(snapped, in_blend,
+                        b.switch('INT', is_view, FINAL_ITERATIONS, PREVIEW_ITERATIONS))
     b.label(projected, "5b Project Blend")
 
     def relax(geometry, label):
@@ -743,7 +823,8 @@ def _build_main(tree, field_tree, project_tree):
         # When nothing is folded the selection is empty and this is cheap.
         face_normal = b.make("GeometryNodeInputNormal")
         grad_on_face = b.make("GeometryNodeFieldOnDomain", {
-            "Value": b.named(ATTR_GRAD, 'FLOAT_VECTOR'),
+            "Value": b.make("GeometryNodeFieldOnDomain", {"Value": _state(b)[2]},
+                            domain='POINT', data_type='FLOAT_VECTOR'),
         }, domain='FACE', data_type='FLOAT_VECTOR')
         flipped = b.compare('LESS_THAN', b.vec('DOT_PRODUCT', face_normal, grad_on_face), 0.0)
         marked = b.store(geometry, ATTR_FOLD, b.switch('FLOAT', flipped, 0.0, 1.0),
@@ -764,12 +845,28 @@ def _build_main(tree, field_tree, project_tree):
     for round_index in range(REPAIR_ROUNDS):
         repaired = repair(repaired, "5d Fold Repair %d" % (round_index + 1))
 
+    # 5e. Sharp-edge band -> clean micro-bevel.  Also covers the faint tail
+    # of a blend that spills over a sharp edge (low blend weight, where the
+    # fillet's bulge is microscopic), never the body of a fillet.
+    on_edge = b.boolean('AND', b.compare('GREATER_THAN', edge, 0.0),
+                        b.compare('LESS_THAN', _state(b)[1], EDGE_TAIL))
+    for _ in range(EDGE_SMOOTH_ROUNDS):
+        blur = b.node("GeometryNodeBlurAttribute", data_type='FLOAT_VECTOR')
+        b.set(blur, "Value", b.position())
+        b.set(blur, "Iterations", EDGE_SMOOTH_BLUR)
+        toward = b.vec('SCALE', b.vec('SUBTRACT', b.out(blur, "Value"), b.position()),
+                       scale=edge)
+        repaired = b.make("GeometryNodeSetPosition", {
+            "Geometry": repaired, "Selection": on_edge, "Offset": toward,
+        })
+    b.label(repaired, "5e Edges")
+
     # 6. Finish ------------------------------------------------------------------
     result = _transfer_materials(b, repaired, src)
     result = b.make("GeometryNodeSetShadeSmooth", {
         "Geometry": result, "Shade Smooth": b.out(gin, "Shade Smooth"),
     })
-    for name in (ATTR_SRC, ATTR_BLEND, ATTR_TMP, ATTR_MARK, ATTR_GRAD, ATTR_FOLD):
+    for name in (ATTR_SRC, ATTR_BLEND, ATTR_TMP, ATTR_MARK, ATTR_STATE, ATTR_FOLD):
         result = b.make("GeometryNodeRemoveAttribute", {"Geometry": result, "Name": name})
 
     # Nothing to blend (empty collection): output nothing, cleanly.
@@ -835,7 +932,11 @@ def _smooth_sources(b, src, count, voxel):
 
 
 def _capture_items(node, items):
-    """Configure Capture Attribute items (multi-item API, Blender 4.2+)."""
+    """Configure Capture Attribute items (multi-item API, Blender 4.2+).
+
+    Always wire the item sockets by *name*: 5.x added a Selection socket at
+    index 1, so positional indices differ between versions.
+    """
     node.capture_items.clear()
     for socket_type, name in items:
         node.capture_items.new(socket_type, name)

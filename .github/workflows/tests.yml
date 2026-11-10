@@ -1,0 +1,55 @@
+name: tests
+
+# Runs the headless acceptance suite and the install-as-extension test on
+# the oldest supported Blender, the 4.x LTS and the latest release, using
+# Blender's official `bpy` module from PyPI.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  blender:
+    name: Blender ${{ matrix.blender }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - blender: "4.2.23"     # 4.2 LTS - oldest supported
+            python: "3.11"
+          - blender: "4.5.16"     # 4.5 LTS
+            python: "3.11"
+          - blender: "5.2.3"      # latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: System libraries for bpy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 \
+            libxkbcommon0 libsm6 libgl1 libegl1
+
+      - name: Install Blender as a Python module
+        run: pip install "bpy==${{ matrix.blender }}"
+
+      - name: Acceptance tests
+        run: python tests/run_tests.py
+
+      - name: Build and install as an extension
+        run: |
+          python tools/build.py
+          python tests/test_install.py dist/blend_master-1.0.0.zip
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.blender == '5.2.3'
+        with:
+          name: blend_master-extension
+          path: dist/*.zip
