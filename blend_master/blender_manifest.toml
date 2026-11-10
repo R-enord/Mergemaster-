@@ -1,0 +1,29 @@
+schema_version = "1.0.0"
+
+# Extension identity. `id` must never change after the first public release,
+# otherwise Blender treats an update as a different extension.
+id = "blend_master"
+version = "1.0.0"
+name = "Blend Master"
+tagline = "Fuse meshes with smooth, live, non-destructive blends"
+maintainer = "Abdulsalam Jamiu Adeniyi"
+type = "add-on"
+
+website = "https://github.com/R-enord/blend-master"
+
+tags = ["Modeling", "Geometry Nodes", "Mesh"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Abdulsalam Jamiu Adeniyi"]
+
+# Blend Master is pure bpy + Geometry Nodes: no files, network, or clipboard
+# access, and no bundled Python wheels.
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  ".*",
+]
